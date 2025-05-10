@@ -1,295 +1,131 @@
+// worker.js
 import { connect } from "cloudflare:sockets";
-
-const proxyListURL = 'https://raw.githubusercontent.com/AFRcloud/ProxyList/refs/heads/main/ProxyList.txt';
-
-// Global Variables
-let cachedProxyList = [];
-let proxyIP = "";
-
-// Constants
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
-
-async function getProxyList(forceReload = false) {
-  if (!cachedProxyList.length || forceReload) {
-    if (!proxyListURL) {
-      throw new Error("No Proxy List URL Provided!");
-    }
-
-    const proxyBank = await fetch(proxyListURL);
-    if (proxyBank.status === 200) {
-      const proxyString = ((await proxyBank.text()) || "").split("\n").filter(Boolean);
-      cachedProxyList = proxyString
-        .map((entry) => {
-          const [proxyIP, proxyPort, country, org] = entry.split(",");
-          return {
-            proxyIP: proxyIP || "Unknown",
-            proxyPort: proxyPort || "Unknown",
-            country: country.toUpperCase() || "Unknown",
-            org: org || "Unknown Org",
-          };
-        })
-        .filter(Boolean);
-    }
-  }
-
-  return cachedProxyList;
-}
-
-export default {
-  async fetch(request, env, ctx) {
+var listProxy = [
+  { path: "/afrcloud-id", proxy: "172.232.239.151:587" },
+];
+var proxyIP;
+var proxyPort;
+export default  {
+  async fetch(request, ctx) {
     try {
+      proxyIP = proxyIP;
       const url = new URL(request.url);
       const upgradeHeader = request.headers.get("Upgrade");
-
-      // Map untuk menyimpan proxy per country code
-      const proxyState = new Map();
-
-      // Fungsi untuk memperbarui proxy setiap menit
-      async function updateProxies() {
-        const proxies = await getProxyList(env);
-        const groupedProxies = groupBy(proxies, "country");
-
-        for (const [countryCode, proxies] of Object.entries(groupedProxies)) {
-          const randomIndex = Math.floor(Math.random() * proxies.length);
-          proxyState.set(countryCode, proxies[randomIndex]);
-        }
-
-        console.log("Proxy list updated:", Array.from(proxyState.entries()));
-      }
-
-      // Jalankan pembaruan proxy setiap menit
-      ctx.waitUntil(
-        (async function periodicUpdate() {
-          await updateProxies();
-          setInterval(updateProxies, 60000); // Setiap 60 detik
-        })()
-      );
-
-      if (upgradeHeader === "websocket") {
-        // Match path dengan format /CC atau /CCangka
-        const pathMatch = url.pathname.match(/^\/([A-Z]{2})(\d+)?$/);
-
-        if (pathMatch) {
-          const countryCode = pathMatch[1];
-          const index = pathMatch[2] ? parseInt(pathMatch[2], 10) - 1 : null;
-
-          console.log(`Country Code: ${countryCode}, Index: ${index}`);
-
-          // Ambil proxy berdasarkan country code
-          const proxies = await getProxyList(env);
-          const filteredProxies = proxies.filter((proxy) => proxy.country === countryCode);
-
-          if (filteredProxies.length === 0) {
-            return new Response(`No proxies available for country: ${countryCode}`, { status: 404 });
-          }
-
-          let selectedProxy;
-
-          if (index === null) {
-            // Ambil proxy acak dari state jika ada
-            selectedProxy = proxyState.get(countryCode) || filteredProxies[0];
-          } else if (index < 0 || index >= filteredProxies.length) {
-            return new Response(
-              `Index ${index + 1} out of bounds. Only ${filteredProxies.length} proxies available for ${countryCode}.`,
-              { status: 400 }
-            );
-          } else {
-            selectedProxy = filteredProxies[index];
-          }
-
-          proxyIP = `${selectedProxy.proxyIP}:${selectedProxy.proxyPort}`;
-          console.log(`Selected Proxy: ${proxyIP}`);
-          return await websockerHandler(request);
-        }
-
-        // Match path dengan format ip:port atau ip=port
-        const ipPortMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-
-        if (ipPortMatch) {
-          proxyIP = ipPortMatch[1].replace(/[=:-]/, ":"); // Standarisasi menjadi ip:port
-          console.log(`Direct Proxy IP: ${proxyIP}`);
-          return await websockerHandler(request, proxyIP);
+      for (const entry of listProxy) {
+        if (url.pathname === entry.path) {
+          [proxyIP, proxyPort] = entry.proxy.split(':');
+          break;
         }
       }
+      if (upgradeHeader === "websocket" && proxyIP) {
+        return await afrcloudOverWSHandler(request);
+      }
+ 
     } catch (err) {
-      return new Response(`An error occurred: ${err.toString()}`, {
-        status: 500,
-      });
+      return new Response(err.toString(), { status: 500 });
     }
-  },
+  }
 };
 
-// Helper function: Group proxies by country
-function groupBy(array, key) {
-  return array.reduce((result, currentValue) => {
-    (result[currentValue[key]] = result[currentValue[key]] || []).push(currentValue);
-    return result;
-  }, {});
-}
-
-async function websockerHandler(request) {
+async function afrcloudOverWSHandler(request) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
-
   webSocket.accept();
-
-  let addressLog = "";
-  let portLog = "";
+  let address = "";
+  let portWithRandomLog = "";
   const log = (info, event) => {
-    console.log(`[${addressLog}:${portLog}] ${info}`, event || "");
+    console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
   };
   const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-
   const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
-
-  let remoteSocketWrapper = {
-    value: null,
+  let remoteSocketWapper = {
+    value: null
   };
   let udpStreamWrite = null;
-  let isDNS = false;
-
-  readableWebSocketStream
-    .pipeTo(
-      new WritableStream({
-        async write(chunk, controller) {
-          if (isDNS && udpStreamWrite) {
-            return udpStreamWrite(chunk);
-          }
-          if (remoteSocketWrapper.value) {
-            const writer = remoteSocketWrapper.value.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock();
-            return;
-          }
-
-          const protocol = await protocolSniffer(chunk);
-          let protocolHeader;
-
-          if (protocol === "Trojan") {
-            protocolHeader = parseTrojanHeader(chunk);
-          } else if (protocol === "VLESS") {
-            protocolHeader = parseVlessHeader(chunk);
-          } else if (protocol === "Shadowsocks") {
-            protocolHeader = parseShadowsocksHeader(chunk);
-          } else {
-            parseVmessHeader(chunk);
-            throw new Error("Unknown Protocol!");
-          }
-
-          addressLog = protocolHeader.addressRemote;
-          portLog = `${protocolHeader.portRemote} -> ${protocolHeader.isUDP ? "UDP" : "TCP"}`;
-
-          if (protocolHeader.hasError) {
-            throw new Error(protocolHeader.message);
-          }
-
-          if (protocolHeader.isUDP) {
-            if (protocolHeader.portRemote === 53) {
-              isDNS = true;
-            } else {
-              throw new Error("UDP only support for DNS port 53");
-            }
-          }
-
-          if (isDNS) {
-            const { write } = await handleUDPOutbound(webSocket, protocolHeader.version, log);
-            udpStreamWrite = write;
-            udpStreamWrite(protocolHeader.rawClientData);
-            return;
-          }
-
-          handleTCPOutBound(
-            remoteSocketWrapper,
-            protocolHeader.addressRemote,
-            protocolHeader.portRemote,
-            protocolHeader.rawClientData,
-            webSocket,
-            protocolHeader.version,
-            log
-          );
-        },
-        close() {
-          log(`readableWebSocketStream is close`);
-        },
-        abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
-        },
-      })
-    )
-    .catch((err) => {
-      log("readableWebSocketStream pipeTo error", err);
-    });
-
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-  });
-}
-
-async function protocolSniffer(buffer) {
-  if (buffer.byteLength >= 62) {
-    const trojanDelimiter = new Uint8Array(buffer.slice(56, 60));
-    if (trojanDelimiter[0] === 0x0d && trojanDelimiter[1] === 0x0a) {
-      if (trojanDelimiter[2] === 0x01 || trojanDelimiter[2] === 0x03 || trojanDelimiter[2] === 0x7f) {
-        if (trojanDelimiter[3] === 0x01 || trojanDelimiter[3] === 0x03 || trojanDelimiter[3] === 0x04) {
-          return "Trojan";
+  let isDns = false;
+  readableWebSocketStream.pipeTo(new WritableStream({
+    async write(chunk, controller) {
+      if (isDns && udpStreamWrite) {
+        return udpStreamWrite(chunk);
+      }
+      if (remoteSocketWapper.value) {
+        const writer = remoteSocketWapper.value.writable.getWriter();
+        await writer.write(chunk);
+        writer.releaseLock();
+        return;
+      }
+      const {
+        hasError,
+        message,
+        portRemote = 443,
+        addressRemote = "",
+        rawDataIndex,
+        afrcloudVersion = new Uint8Array([0, 0]),
+        isUDP
+      } = processafrcloudHeader(chunk);
+      address = addressRemote;
+      portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
+      if (hasError) {
+        throw new Error(message);
+        return;
+      }
+      if (isUDP) {
+        if (portRemote === 53) {
+          isDns = true;
+        } else {
+          throw new Error("UDP proxy only enable for DNS which is port 53");
+          return;
         }
       }
+      const afrcloudResponseHeader = new Uint8Array([afrcloudVersion[0], 0]);
+      const rawClientData = chunk.slice(rawDataIndex);
+      if (isDns) {
+        const { write } = await handleUDPOutBound(webSocket, afrcloudResponseHeader, log);
+        udpStreamWrite = write;
+        udpStreamWrite(rawClientData);
+        return;
+      }
+      handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, afrcloudResponseHeader, log);
+    },
+    close() {
+      log(`readableWebSocketStream is close`);
+    },
+    abort(reason) {
+      log(`readableWebSocketStream is abort`, JSON.stringify(reason));
     }
-  }
-
-  const vlessDelimiter = new Uint8Array(buffer.slice(1, 17));
-  // Hanya mendukung UUID v4
-  if (arrayBufferToHex(vlessDelimiter).match(/^\w{8}\w{4}4\w{3}[89ab]\w{3}\w{12}$/)) {
-    return "VLESS";
-  }
-
-  return "Shadowsocks"; // default
+  })).catch((err) => {
+    log("readableWebSocketStream pipeTo error", err);
+  });
+  return new Response(null, {
+    status: 101,
+    webSocket: client
+  });
 }
-
-async function handleTCPOutBound(
-  remoteSocket,
-  addressRemote,
-  portRemote,
-  rawClientData,
-  webSocket,
-  responseHeader,
-  log
-) {
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, afrcloudResponseHeader, log) {
   async function connectAndWrite(address, port) {
-    const tcpSocket = connect({
+    const tcpSocket2 = connect({
       hostname: address,
-      port: port,
+      port
     });
-    remoteSocket.value = tcpSocket;
+    remoteSocket.value = tcpSocket2;
     log(`connected to ${address}:${port}`);
-    const writer = tcpSocket.writable.getWriter();
+    const writer = tcpSocket2.writable.getWriter();
     await writer.write(rawClientData);
     writer.releaseLock();
-    return tcpSocket;
+    return tcpSocket2;
   }
-
   async function retry() {
-    const tcpSocket = await connectAndWrite(
-      proxyIP.split(/[:=-]/)[0] || addressRemote,
-      proxyIP.split(/[:=-]/)[1] || portRemote
-    );
-    tcpSocket.closed
-      .catch((error) => {
-        console.log("retry tcpSocket closed error", error);
-      })
-      .finally(() => {
-        safeCloseWebSocket(webSocket);
-      });
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
+    const tcpSocket2 = await connectAndWrite(proxyIP || addressRemote, proxyPort || portRemote);
+    tcpSocket2.closed.catch((error) => {
+      console.log("retry tcpSocket closed error", error);
+    }).finally(() => {
+      safeCloseWebSocket(webSocket);
+    });
+    remoteSocketToWS(tcpSocket2, webSocket, afrcloudResponseHeader, null, log);
   }
-
   const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-
-  remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
+  remoteSocketToWS(tcpSocket, webSocket, afrcloudResponseHeader, retry, log);
 }
-
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   let readableStreamCancel = false;
   const stream = new ReadableStream({
@@ -301,17 +137,23 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         const message = event.data;
         controller.enqueue(message);
       });
-      webSocketServer.addEventListener("close", () => {
-        safeCloseWebSocket(webSocketServer);
-        if (readableStreamCancel) {
-          return;
+      webSocketServer.addEventListener(
+        "close",
+        () => {
+          safeCloseWebSocket(webSocketServer);
+          if (readableStreamCancel) {
+            return;
+          }
+          controller.close();
         }
-        controller.close();
-      });
-      webSocketServer.addEventListener("error", (err) => {
-        log("webSocketServer has error");
-        controller.error(err);
-      });
+      );
+      webSocketServer.addEventListener(
+        "error",
+        (err) => {
+          log("webSocketServer has error");
+          controller.error(err);
+        }
+      );
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
       if (error) {
         controller.error(error);
@@ -319,8 +161,8 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         controller.enqueue(earlyData);
       }
     },
-
-    pull(controller) {},
+    pull(controller) {
+    },
     cancel(reason) {
       if (readableStreamCancel) {
         return;
@@ -328,182 +170,71 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
       log(`ReadableStream was canceled, due to ${reason}`);
       readableStreamCancel = true;
       safeCloseWebSocket(webSocketServer);
-    },
+    }
   });
-
   return stream;
 }
-
-function parseVmessHeader(vmessBuffer) {
-  // https://xtls.github.io/development/protocols/vmess.html#%E6%8C%87%E4%BB%A4%E9%83%A8%E5%88%86
-}
-
-function parseShadowsocksHeader(ssBuffer) {
-  const view = new DataView(ssBuffer);
-
-  const addressType = view.getUint8(0);
-  let addressLength = 0;
-  let addressValueIndex = 1;
-  let addressValue = "";
-
-  switch (addressType) {
-    case 1:
-      addressLength = 4;
-      addressValue = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
-      break;
-    case 3:
-      addressLength = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
-      addressValueIndex += 1;
-      addressValue = new TextDecoder().decode(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
-      break;
-    case 4:
-      addressLength = 16;
-      const dataView = new DataView(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
-      }
-      addressValue = ipv6.join(":");
-      break;
-    default:
-      return {
-        hasError: true,
-        message: `Invalid addressType for Shadowsocks: ${addressType}`,
-      };
-  }
-
-  if (!addressValue) {
+function processafrcloudHeader(afrcloudBuffer) {
+  if (afrcloudBuffer.byteLength < 24) {
     return {
       hasError: true,
-      message: `Destination address empty, address type is: ${addressType}`,
+      message: "invalid data"
     };
   }
-
-  const portIndex = addressValueIndex + addressLength;
-  const portBuffer = ssBuffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
-  return {
-    hasError: false,
-    addressRemote: addressValue,
-    addressType: addressType,
-    portRemote: portRemote,
-    rawDataIndex: portIndex + 2,
-    rawClientData: ssBuffer.slice(portIndex + 2),
-    version: null,
-    isUDP: portRemote == 53,
-  };
-}
-
-function parseVlessHeader(vlessBuffer) {
-  const version = new Uint8Array(vlessBuffer.slice(0, 1));
+  const version = new Uint8Array(afrcloudBuffer.slice(0, 1));
+  let isValidUser = true;
   let isUDP = false;
-
-  const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
-
-  const cmd = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
-  if (cmd === 1) {
-  } else if (cmd === 2) {
+  if (!isValidUser) {
+    return {
+      hasError: true,
+      message: "invalid user"
+    };
+  }
+  const optLength = new Uint8Array(afrcloudBuffer.slice(17, 18))[0];
+  const command = new Uint8Array(
+    afrcloudBuffer.slice(18 + optLength, 18 + optLength + 1)
+  )[0];
+  if (command === 1) {
+  } else if (command === 2) {
     isUDP = true;
   } else {
     return {
       hasError: true,
-      message: `command ${cmd} is not support, command 01-tcp,02-udp,03-mux`,
+      message: `command ${command} is not support, command 01-tcp,02-udp,03-mux`
     };
   }
   const portIndex = 18 + optLength + 1;
-  const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
+  const portBuffer = afrcloudBuffer.slice(portIndex, portIndex + 2);
   const portRemote = new DataView(portBuffer).getUint16(0);
-
   let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
-
+  const addressBuffer = new Uint8Array(
+    afrcloudBuffer.slice(addressIndex, addressIndex + 1)
+  );
   const addressType = addressBuffer[0];
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
   let addressValue = "";
   switch (addressType) {
-    case 1: // For IPv4
+    case 1:
       addressLength = 4;
-      addressValue = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
+      addressValue = new Uint8Array(
+        afrcloudBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+      ).join(".");
       break;
-    case 2: // For Domain
-      addressLength = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
-      addressValueIndex += 1;
-      addressValue = new TextDecoder().decode(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
-      break;
-    case 3: // For IPv6
-      addressLength = 16;
-      const dataView = new DataView(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
-      }
-      addressValue = ipv6.join(":");
-      break;
-    default:
-      return {
-        hasError: true,
-        message: `invild  addressType is ${addressType}`,
-      };
-  }
-  if (!addressValue) {
-    return {
-      hasError: true,
-      message: `addressValue is empty, addressType is ${addressType}`,
-    };
-  }
-
-  return {
-    hasError: false,
-    addressRemote: addressValue,
-    addressType: addressType,
-    portRemote: portRemote,
-    rawDataIndex: addressValueIndex + addressLength,
-    rawClientData: vlessBuffer.slice(addressValueIndex + addressLength),
-    version: new Uint8Array([version[0], 0]),
-    isUDP: isUDP,
-  };
-}
-
-function parseTrojanHeader(buffer) {
-  const socks5DataBuffer = buffer.slice(58);
-  if (socks5DataBuffer.byteLength < 6) {
-    return {
-      hasError: true,
-      message: "invalid SOCKS5 request data",
-    };
-  }
-
-  let isUDP = false;
-  const view = new DataView(socks5DataBuffer);
-  const cmd = view.getUint8(0);
-  if (cmd == 3) {
-    isUDP = true;
-  } else if (cmd != 1) {
-    throw new Error("Unsupported command type!");
-  }
-
-  let addressType = view.getUint8(1);
-  let addressLength = 0;
-  let addressValueIndex = 2;
-  let addressValue = "";
-  switch (addressType) {
-    case 1: // For IPv4
-      addressLength = 4;
-      addressValue = new Uint8Array(socks5DataBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(
-        "."
-      );
-      break;
-    case 3: // For Domain
-      addressLength = new Uint8Array(socks5DataBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+    case 2:
+      addressLength = new Uint8Array(
+        afrcloudBuffer.slice(addressValueIndex, addressValueIndex + 1)
+      )[0];
       addressValueIndex += 1;
       addressValue = new TextDecoder().decode(
-        socks5DataBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+        afrcloudBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
       );
       break;
-    case 4: // For IPv6
+    case 3:
       addressLength = 16;
-      const dataView = new DataView(socks5DataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
+      const dataView = new DataView(
+        afrcloudBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+      );
       const ipv6 = [];
       for (let i = 0; i < 8; i++) {
         ipv6.push(dataView.getUint16(i * 2).toString(16));
@@ -513,69 +244,67 @@ function parseTrojanHeader(buffer) {
     default:
       return {
         hasError: true,
-        message: `invalid addressType is ${addressType}`,
+        message: `invild  addressType is ${addressType}`
       };
   }
-
   if (!addressValue) {
     return {
       hasError: true,
-      message: `address is empty, addressType is ${addressType}`,
+      message: `addressValue is empty, addressType is ${addressType}`
     };
   }
-
-  const portIndex = addressValueIndex + addressLength;
-  const portBuffer = socks5DataBuffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
   return {
     hasError: false,
     addressRemote: addressValue,
-    addressType: addressType,
-    portRemote: portRemote,
-    rawDataIndex: portIndex + 4,
-    rawClientData: socks5DataBuffer.slice(portIndex + 4),
-    version: null,
-    isUDP: isUDP,
+    addressType,
+    portRemote,
+    rawDataIndex: addressValueIndex + addressLength,
+    afrcloudVersion: version,
+    isUDP
   };
 }
-
-async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log) {
-  let header = responseHeader;
+async function remoteSocketToWS(remoteSocket, webSocket, afrcloudResponseHeader, retry, log) {
+  let remoteChunkCount = 0;
+  let chunks = [];
+  let afrcloudHeader = afrcloudResponseHeader;
   let hasIncomingData = false;
-  await remoteSocket.readable
-    .pipeTo(
-      new WritableStream({
-        start() {},
-        async write(chunk, controller) {
-          hasIncomingData = true;
-          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-            controller.error("webSocket.readyState is not open, maybe close");
-          }
-          if (header) {
-            webSocket.send(await new Blob([header, chunk]).arrayBuffer());
-            header = null;
-          } else {
-            webSocket.send(chunk);
-          }
-        },
-        close() {
-          log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-        },
-        abort(reason) {
-          console.error(`remoteConnection!.readable abort`, reason);
-        },
-      })
-    )
-    .catch((error) => {
-      console.error(`remoteSocketToWS has exception `, error.stack || error);
-      safeCloseWebSocket(webSocket);
-    });
+  await remoteSocket.readable.pipeTo(
+    new WritableStream({
+      start() {
+      },
+      async write(chunk, controller) {
+        hasIncomingData = true;
+        if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+          controller.error(
+            "webSocket.readyState is not open, maybe close"
+          );
+        }
+        if (afrcloudHeader) {
+          webSocket.send(await new Blob([afrcloudHeader, chunk]).arrayBuffer());
+          afrcloudHeader = null;
+        } else {
+          webSocket.send(chunk);
+        }
+      },
+      close() {
+        log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+      },
+      abort(reason) {
+        console.error(`remoteConnection!.readable abort`, reason);
+      }
+    })
+  ).catch((error) => {
+    console.error(
+      `remoteSocketToWS has exception `,
+      error.stack || error
+    );
+    safeCloseWebSocket(webSocket);
+  });
   if (hasIncomingData === false && retry) {
     log(`retry`);
     retry();
   }
 }
-
 function base64ToArrayBuffer(base64Str) {
   if (!base64Str) {
     return { error: null };
@@ -589,65 +318,8 @@ function base64ToArrayBuffer(base64Str) {
     return { error };
   }
 }
-
-function arrayBufferToHex(buffer) {
-  return [...new Uint8Array(buffer)].map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-
-async function handleUDPOutbound(webSocket, responseHeader, log) {
-  let isVlessHeaderSent = false;
-  const transformStream = new TransformStream({
-    start(controller) {},
-    transform(chunk, controller) {
-      for (let index = 0; index < chunk.byteLength; ) {
-        const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
-        const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPakcetLength));
-        index = index + 2 + udpPakcetLength;
-        controller.enqueue(udpData);
-      }
-    },
-    flush(controller) {},
-  });
-  transformStream.readable
-    .pipeTo(
-      new WritableStream({
-        async write(chunk) {
-          const resp = await fetch("https://1.1.1.1/dns-query", {
-            method: "POST",
-            headers: {
-              "content-type": "application/dns-message",
-            },
-            body: chunk,
-          });
-          const dnsQueryResult = await resp.arrayBuffer();
-          const udpSize = dnsQueryResult.byteLength;
-          const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            log(`doh success and dns message length is ${udpSize}`);
-            if (isVlessHeaderSent) {
-              webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-            } else {
-              webSocket.send(await new Blob([responseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-              isVlessHeaderSent = true;
-            }
-          }
-        },
-      })
-    )
-    .catch((error) => {
-      log("dns udp has error" + error);
-    });
-
-  const writer = transformStream.writable.getWriter();
-
-  return {
-    write(chunk) {
-      writer.write(chunk);
-    },
-  };
-}
-
+var WS_READY_STATE_OPEN = 1;
+var WS_READY_STATE_CLOSING = 2;
 function safeCloseWebSocket(socket) {
   try {
     if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
@@ -656,4 +328,58 @@ function safeCloseWebSocket(socket) {
   } catch (error) {
     console.error("safeCloseWebSocket error", error);
   }
+}
+async function handleUDPOutBound(webSocket, afrcloudResponseHeader, log) {
+  let isafrcloudHeaderSent = false;
+  const transformStream = new TransformStream({
+    start(controller) {
+    },
+    transform(chunk, controller) {
+      for (let index = 0; index < chunk.byteLength; ) {
+        const lengthBuffer = chunk.slice(index, index + 2);
+        const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+        const udpData = new Uint8Array(
+          chunk.slice(index + 2, index + 2 + udpPakcetLength)
+        );
+        index = index + 2 + udpPakcetLength;
+        controller.enqueue(udpData);
+      }
+    },
+    flush(controller) {
+    }
+  });
+  transformStream.readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      const resp = await fetch(
+        "https://1.1.1.1/dns-query",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/dns-message"
+          },
+          body: chunk
+        }
+      );
+      const dnsQueryResult = await resp.arrayBuffer();
+      const udpSize = dnsQueryResult.byteLength;
+      const udpSizeBuffer = new Uint8Array([udpSize >> 8 & 255, udpSize & 255]);
+      if (webSocket.readyState === WS_READY_STATE_OPEN) {
+        log(`doh success and dns message length is ${udpSize}`);
+        if (isafrcloudHeaderSent) {
+          webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+        } else {
+          webSocket.send(await new Blob([afrcloudResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+          isafrcloudHeaderSent = true;
+        }
+      }
+    }
+  })).catch((error) => {
+    log("dns udp has error" + error);
+  });
+  const writer = transformStream.writable.getWriter();
+  return {
+    write(chunk) {
+      writer.write(chunk);
+    }
+  };
 }
